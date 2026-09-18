@@ -1040,7 +1040,11 @@ tresult PLUGIN_API mu_plugin::process(ProcessData &data)
 			for (int32 p = 0; p < np; p++) {
 				int32 off = 0;
 				ParamValue v = 0.0;
-				if (pq->getPoint(p, off, v) != kResultOk)
+
+				// REAPER PC offset暫定措置
+				int32 ignoredOff = 0;
+
+				if (pq->getPoint(p, ignoredOff, v) != kResultOk)
 					continue;
 				m_value[slot] = v;
 				// ここで「前と同じ値だから」と捨ててはいけない。RPN/NRPN は

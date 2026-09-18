@@ -543,11 +543,12 @@ const clap_plugin_audio_ports_t mu_plugin::s_audio_ports = {
 	},
 };
 
+// REAPER向けに入力ポート数を1に制限
 const clap_plugin_note_ports_t mu_plugin::s_note_ports = {
-	[](const clap_plugin_t *, bool is_input) -> uint32_t { return is_input ? kPorts : 0; },
-	[](const clap_plugin_t *, uint32_t index, bool is_input, clap_note_port_info_t *info) {
-		return note_port(index, is_input, info);
-	},
+    [](const clap_plugin_t *, bool is_input) -> uint32_t { return is_input ? 1 : 0; },
+    [](const clap_plugin_t *, uint32_t index, bool is_input, clap_note_port_info_t *info) {
+        return note_port(index, is_input, info);
+    },
 };
 
 // 並びは出力レベル、XG の値（automation.h の表の順）。XG の値は XG の整数のまま（min〜max）
