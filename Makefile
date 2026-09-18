@@ -333,8 +333,8 @@ $(BUILD)/live$(EXE): $(OBJS) $(BUILD)/src/mu2000.o $(BUILD)/src/ui/midi_in.o $(B
 #   make vst3      build/S-MU2000.vst3/ にバンドルを作る
 #   make install-vst3   それを VST3 の置き場へ複製する
 
-VST3_DIR  := $(BUILD)/S-MU2000.vst3
-VST3_BIN  := $(VST3_DIR)/Contents/x86_64-win/S-MU2000.vst3
+VST3_DIR  := $(BUILD)/S-MU2000_rp.vst3
+VST3_BIN  := $(VST3_DIR)/Contents/x86_64-win/S-MU2000_rp.vst3
 VST3_INC  := -I third_party/vst3
 
 VST3_SDK_SRCS := 	third_party/vst3/pluginterfaces/base/funknown.cpp 	third_party/vst3/pluginterfaces/base/coreiids.cpp 	third_party/vst3/pluginterfaces/base/conststringtable.cpp 	third_party/vst3/pluginterfaces/base/ustring.cpp
@@ -371,9 +371,9 @@ ifeq ($(PROGRAMFILES),)
 	$(error CROSS=windows: there is no Program Files here -- pass VST3_INSTALL=<dir> to copy the bundle somewhere you can pick it up from)
 endif
 endif
-	rm -rf "$(VST3_INSTALL)/S-MU2000.vst3"
+	rm -rf "$(VST3_INSTALL)/S-MU2000_rp.vst3"
 	cp -r $(VST3_DIR) "$(VST3_INSTALL)/"
-	@echo "入れた: $(VST3_INSTALL)/S-MU2000.vst3"
+	@echo "入れた: $(VST3_INSTALL)/S-MU2000_rp.vst3"
 
 # 工場が名乗るかどうかだけを確かめる小さな道具
 $(BUILD)/vst3probe$(EXE): $(BUILD)/vst3obj/src/vst3/probe.o $(BUILD)/vst3obj/src/vst3/probe_host_win.o                         $(BUILD)/vst3obj/src/vst3/iids.o                         $(BUILD)/vst3obj/third_party/vst3/pluginterfaces/base/funknown.o                         $(BUILD)/vst3obj/third_party/vst3/pluginterfaces/base/coreiids.o                         $(BUILD)/vst3obj/third_party/vst3/pluginterfaces/base/conststringtable.o                         $(BUILD)/vst3obj/third_party/vst3/pluginterfaces/base/ustring.o                         $(BUILD)/src/smf.o $(BUILD)/src/compat/compat.o
@@ -395,7 +395,7 @@ endif
 #   make clap          build/S-MU2000.clap を作る（CLAP は DLL 1 本）
 #   make install-clap  それを CLAP の置き場へ複製する
 
-CLAP_BIN  := $(BUILD)/S-MU2000.clap
+CLAP_BIN  := $(BUILD)/S-MU2000_rp.clap
 CLAP_INC  := -I third_party/clap $(VST3_INC)
 CLAP_OBJS := $(BUILD)/clapobj/src/clap/plugin.o $(filter-out $(BUILD)/vst3obj/src/vst3/plugin.o,$(VST3_OBJS))
 
@@ -420,7 +420,7 @@ CLAP_INSTALL ?= $(PROGRAMFILES)/Common Files/CLAP
 install-clap: $(CLAP_BIN)
 	mkdir -p "$(CLAP_INSTALL)"
 	cp -f $(CLAP_BIN) "$(CLAP_INSTALL)/"
-	@echo "入れた: $(CLAP_INSTALL)/S-MU2000.clap"
+	@echo "入れた: $(CLAP_INSTALL)/S-MU2000_rp.clap"
 
 # The Audio Unit is a macOS port; nothing to build here
 au install-au au-probe check-au:
@@ -524,8 +524,8 @@ $(BUILD)/gui$(EXE): $(OBJS) $(BUILD)/src/mu2000.o $(BUILD)/src/smf.o $(MAC_GUI_O
 # Contents/Info.plist declares what the package is. A host opens it with CFBundle
 # rather than dlopen and calls bundleEntry (end of plugin.cpp).
 
-VST3_DIR  := $(BUILD)/S-MU2000.vst3
-VST3_BIN  := $(VST3_DIR)/Contents/MacOS/S-MU2000
+VST3_DIR  := $(BUILD)/S-MU2000_rp.vst3
+VST3_BIN  := $(VST3_DIR)/Contents/MacOS/S-MU2000_rp
 VST3_INC  := -I third_party/vst3
 
 VST3_SDK_SRCS := \
@@ -579,10 +579,10 @@ $(VST3_BIN): $(OBJS) $(BUILD)/src/mu2000.o $(VST3_OBJS) $(MAC_PC_OBJS)
 VST3_INSTALL ?= $(HOME)/Library/Audio/Plug-Ins/VST3
 
 install-vst3: $(VST3_BIN)
-	rm -rf "$(VST3_INSTALL)/S-MU2000.vst3"
+	rm -rf "$(VST3_INSTALL)/S-MU2000_rp.vst3"
 	mkdir -p "$(VST3_INSTALL)"
 	cp -r $(VST3_DIR) "$(VST3_INSTALL)/"
-	@echo "入れた: $(VST3_INSTALL)/S-MU2000.vst3"
+	@echo "入れた: $(VST3_INSTALL)/S-MU2000_rp.vst3"
 
 # ---- CLAP plug-in (macOS)
 #
@@ -590,8 +590,8 @@ install-vst3: $(VST3_BIN)
 # On macOS a CLAP is a bundle like the VST3: the binary in Contents/MacOS, found
 # through Contents/Info.plist. Not in `all` yet -- it has not been tried in a
 # macOS host
-CLAP_DIR  := $(BUILD)/S-MU2000.clap
-CLAP_BIN  := $(CLAP_DIR)/Contents/MacOS/S-MU2000
+CLAP_DIR  := $(BUILD)/S-MU2000_rp.clap
+CLAP_BIN  := $(CLAP_DIR)/Contents/MacOS/S-MU2000_rp
 CLAP_INC  := -I third_party/clap $(VST3_INC)
 CLAP_OBJS := $(BUILD)/clapobj/src/clap/plugin.o $(filter-out $(BUILD)/vst3obj/src/vst3/plugin.o,$(VST3_OBJS))
 
@@ -613,10 +613,10 @@ $(CLAP_BIN): $(OBJS) $(BUILD)/src/mu2000.o $(CLAP_OBJS) $(MAC_PC_OBJS)
 CLAP_INSTALL ?= $(HOME)/Library/Audio/Plug-Ins/CLAP
 
 install-clap: $(CLAP_BIN)
-	rm -rf "$(CLAP_INSTALL)/S-MU2000.clap"
+	rm -rf "$(CLAP_INSTALL)/S-MU2000_rp.clap"
 	mkdir -p "$(CLAP_INSTALL)"
 	cp -r $(CLAP_DIR) "$(CLAP_INSTALL)/"
-	@echo "入れた: $(CLAP_INSTALL)/S-MU2000.clap"
+	@echo "入れた: $(CLAP_INSTALL)/S-MU2000_rp.clap"
 
 # Small tool that pretends to be a host. Same as the Windows one, except that the
 # module is opened with CFBundle and the parent window is probe_host_mac.mm

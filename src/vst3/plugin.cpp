@@ -66,9 +66,9 @@ namespace {
 
 // ---- このプラグインを表す番号。一度決めたら変えられない
 //      （変えるとホストが別物とみなし、保存した曲から見つからなくなる）
-static const FUID kProcessorUID(0x5D2E4B70, 0xA1C34F92, 0x8B0E7A61, 0x4D553000);
+static const FUID kProcessorUID(0x5D2E4B71, 0xA1C34F93, 0x8B0E7A62, 0x4D553002);
 
-constexpr const char *kPlugName   = "S-MU2000";
+constexpr const char *kPlugName   = "S-MU2000 for REAPER";
 constexpr const char *kVendor     = "tarboh";
 constexpr const char *kVersion    = "0.1.0.0";
 

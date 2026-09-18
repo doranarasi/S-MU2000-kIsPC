@@ -45,7 +45,7 @@ namespace autom = smu2000::automation;
 
 // ---- このプラグインを表す名前。一度決めたら変えられない
 //      （変えるとホストが別物とみなし、保存した曲から見つからなくなる）
-constexpr const char *kPlugId = "io.github.tarboh.s-mu2000";
+constexpr const char *kPlugId = "s-mu2000_for_REAPER";
 
 const char *const kFeatures[] = {
 	CLAP_PLUGIN_FEATURE_INSTRUMENT,
@@ -57,13 +57,13 @@ const char *const kFeatures[] = {
 const clap_plugin_descriptor_t kDescriptor = {
 	CLAP_VERSION_INIT,
 	kPlugId,
-	"S-MU2000",
+	"S-MU2000 for REAPER",
 	"tarboh",
 	"https://github.com/tarboh/S-MU2000",
 	"https://github.com/tarboh/S-MU2000",
 	"https://github.com/tarboh/S-MU2000/issues",
 	"0.1.0",
-	"Yamaha MU2000 emulation",
+	"Yamaha MU2000 emulation(REAPER)",
 	kFeatures,
 };
 
