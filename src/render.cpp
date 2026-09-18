@@ -180,6 +180,9 @@ int main(int argc, char **argv)
 	const char *card_path = nullptr;   // 差す SmartMedia
 	const char *replay = nullptr;      // --replay-swp。記録したレジスタ列を SH-2 無しで流す
 	int native_engine = 0;             // --native-engine。firmware を走らせない口
+	// 写し取りをファイルに残す・読む（voicecache.h）。経路の印が付いているので
+	// 別の曲の写しが混ざっても安全。--no-voicecache で切る
+	bool voicecache = false;
 	for (int i = 4; i < argc; i++) {
 		if (!std::strcmp(argv[i], "--trace-swp") && i + 1 < argc)
 			swptrace = argv[++i];
@@ -217,6 +220,10 @@ int main(int argc, char **argv)
 			native_fx = 1;
 		else if (!std::strcmp(argv[i], "--native-engine"))
 			native_engine = 1;
+		else if (!std::strcmp(argv[i], "--voicecache"))
+			voicecache = true;
+		else if (!std::strcmp(argv[i], "--no-voicecache"))
+			voicecache = false;
 		else if (!std::strcmp(argv[i], "--native-fx-full"))
 			native_fx = 2;
 		else if (!std::strcmp(argv[i], "--bootcache"))
@@ -406,7 +413,7 @@ int main(int argc, char **argv)
 		if (native_engine && i == boot_samples) {
 			mu.set_native_engine(native_engine);
 			// 前に写し取ったものがあれば読む（1 音目から native で鳴らせる）
-			if (!std::getenv("SMU2000_NO_VOICECACHE") &&
+			if (voicecache &&
 			    smu2000::voicecache::load(mu, smu2000::voicecache::key(mu)))
 				std::printf("写し取り: %d 音色を前の写しから\n", int(mu.native_cal_count()));
 		}
@@ -529,7 +536,7 @@ int main(int argc, char **argv)
 	}
 
 	write_wav(wav, pcm, rate);
-	if (native_engine && !std::getenv("SMU2000_NO_VOICECACHE"))
+	if (native_engine && voicecache)
 		smu2000::voicecache::save(mu, smu2000::voicecache::key(mu));
 	if (native_engine) {
 		std::printf("native の口: 演奏中に firmware を回したのは %.1f%%\n",
@@ -545,6 +552,7 @@ int main(int argc, char **argv)
 			            100.0 * double(w.by_other) / double(w.total));
 	}
 	if (native_engine) {
+		std::printf("  いちばん多いときのスロット: %d / 64\n", mu.native_peak_slots());
 		const mu2000::native_stats st = mu.native_counts();
 		std::printf("  鍵: native %llu / firmware %llu（うち写し取り %llu）、そのほかの MIDI %llu\n",
 		            (unsigned long long)st.note_native, (unsigned long long)st.note_fw,

@@ -120,16 +120,46 @@ inline u32 elem_delay(const u8 *elem)
 	return u32(441 * (1 << (n < 8 ? n - 1 : 7)) - 130);
 }
 
+// **波形を選ぶときの鍵**。要素の粗調（byte17）で移した鍵で選ぶ。
+// GtHarmonics（音色 31）は要素が 12 半音下げていて、鍵 84 のときに
+// 鍵 72 のぶんの波形を鳴らしていた（それで音程がぴったり合う）
+inline int wave_note(const u8 *elem, int note)
+{
+	const int n = note + int(elem[17]) - 64;
+	return n < 0 ? 0 : (n > 127 ? 127 : n);
+}
+
 // 要素ぶんの音程のずらし（セント）。byte17 が半音、byte18 がセント
 inline int elem_tune(const u8 *elem)
 {
 	return (int(elem[17]) - 64) * 100 + (int(elem[18]) - 64);
 }
 
+// **ポルタメントの速さ**（doc/native-engine.md の 6.41）。
+// ROM の表 0x1E6698（16bit・128 語）を CC5 で直に引く。目盛りが 2 通りある:
+//   CC5 24-127 … 表 ÷ 128 = 10ms あたりのセント
+//   CC5  0-23  … 表 × 2   = 10ms あたりのセント（256 倍の目盛り）
+// 返すのは**セント × 256**（そのまま足し引きできる細かさ）
+constexpr u32 PORTA_TAB = 0x1E6698;
+constexpr u32 PORTA_TICK = 441;            // firmware は 10ms ごとに足す
+
+inline int porta_step(const u8 *rom, int cc5)
+{
+	if (!rom || cc5 < 0 || cc5 > 127)
+		return 0;
+	const int raw = int(rd16(rom, PORTA_TAB + u32(cc5) * 2));
+	return cc5 < 24 ? raw * 512 : raw * 2;
+}
+
 inline u16 pitch_reg(const wave_info &w, int note, int follow = 100, int cents_extra = 0)
 {
-	// 整数で計算する（firmware と同じ丸めになる。0 の側へ切り捨て）
-	const int cents = (note - w.base_key) * follow + w.fine_cents + cents_extra;
+	// 整数で計算する（firmware と同じ丸めになる。0 の側へ切り捨て）。
+	// **鍵の追従は鍵 60 を支点にする**（波形の基準鍵ではない）。追従が 100 の
+	// ときは同じ式になるが、50 や 20 の音色では基準鍵とのずれぶん食い違う
+	// （Woodblock で 749 セント、TaikoDrum で 1700 セント。どちらも
+	//  50 * (60 - 基準鍵) でぴったり）
+	const int cents = (note - 60) * follow + (60 - w.base_key) * 100
+	                + w.fine_cents + cents_extra;
 	const int v = cents * 1024 / 1200;
 	// ビット 14 は波形の**形式**で決まる（形式 3 のときだけ立つ。402 組で確かめた）
 	const u16 flag = ((w.format_addr >> 30) & 3) == 3 ? 0x4000 : 0;
@@ -165,6 +195,25 @@ inline int pan_att(int x)
 	const double c = std::cos(double(x) / 127.0 * 1.5707963267948966);
 	const int v = int(std::lround(-20.0 * std::log10(c) / 0.375));
 	return v < 0 ? 0 : (v > 255 ? 255 : v);
+}
+
+// 明るさ（CC74）→ レジスタ 0x00 の下 12bit（切る高さ）。
+// 実測（`nativeplay --ccfilter`）は **16 × (値 - 64)** でまっすぐ動き、1984 で頭打ち
+constexpr int CUTOFF_MAX = 1984;
+inline int bright_shift(int cc) { return 16 * (cc - 64); }
+
+// 共振（CC71）→ レジスタ 0x04 の上 5bit。実測は **2 きざみで 1 段**
+// （64 まで 0、67 で 1、127 で 31）
+inline int reso_shift(int cc) { return (cc - 64) / 2; }
+
+// 送り（CC91 リバーブ・CC93 コーラス）→ レジスタ 0x33・0x34 の下位（減衰）。
+// 実測は **16 + level→減衰の表** で、音色によらない（GrandPno・Strings・Flute で同じ）。
+// 使うのは差ぶんだけなので、下駄の 16 は要らない
+inline int send_att(const u8 *rom, int cc)
+{
+	if (cc <= 0)
+		return 255;
+	return int(rom[LEVEL_TAB + u32(std::min(127, cc) - 1)]);
 }
 
 // モジュレーション（CC1）→ レジスタ 0x0a の下位（LFO の深さ）に足す。
@@ -267,7 +316,7 @@ inline int level_from_att(const u8 *rom, int att)
 // 「素の音量」を出す。これがあれば、ほかの鍵・強さの減衰は式で出せる
 inline int wave_level(const u8 *rom, const u8 *elem, int note)
 {
-	const u8 *we = wave_entry(rom, wave_set(elem), note);
+	const u8 *we = wave_entry(rom, wave_set(elem), wave_note(elem, note));
 	return we ? int(we[0]) : 0;
 }
 
@@ -338,6 +387,12 @@ struct voice_cal {
 	int  cal_vel = 100;        // 写し取ったときの強さ（強さを変えるときの基準）
 	// 写し取ったときのコントローラの位置。ここからの差ぶんだけ動かす
 	int  cal_vol = 100, cal_expr = 127, cal_pan = 64, cal_mod = 0;
+	int  cal_rev = 40, cal_cho = 0;      // 写し取ったときの送り（CC91・CC93）
+	int  cal_bri = 64, cal_res = 64;     // 写し取ったときの明るさ・共振（CC74・CC71）
+	// **写し取ったときのパートの「経路」**（素通しの量・バリエーション送り・
+	// パートの EQ・インサーションの掛かり先）をまとめた印。
+	// ここが違うと、写し取った 0x20-0x2b・0x32-0x37 はそのまま使えない
+	u32  cal_ctx = 0;
 	u16  reg[0x40] = {};       // 基準の鍵・強さでの値
 	u64  mask = 0;             // 覚えているレジスタ
 
@@ -378,7 +433,7 @@ inline slot_regs build_note(const u8 *rom, const u8 *elem, int note, int att,
                             const defaults &d = defaults(), int cents_extra = 0)
 {
 	slot_regs r;
-	const u8 *we = wave_entry(rom, wave_set(elem), note);
+	const u8 *we = wave_entry(rom, wave_set(elem), wave_note(elem, note));
 	if (!we)
 		return r;
 	const wave_info w = read_wave(we);
