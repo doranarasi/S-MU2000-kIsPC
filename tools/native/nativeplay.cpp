@@ -142,8 +142,18 @@ std::vector<xg::nv::voice_cal> take_cals(mu2000 &mu, const u8 *rom, u32 rec,
 			}
 		}
 		const u8 *el = xg::nv::element(rom, rec, idx);
-		cal.base_level = xg::nv::calibrate_level(rom, el,
-		    cal.has(9) ? (cal.reg[9] & 0xff) : mu.nvram()[0x3e96a], note, vel);
+		// **音量の目盛りは実機のボイスの塊から直に取る**（doc の 6.102）。
+		// 取れているかは、写し取った 0x09 と組み直した値が合うかで見る
+		{
+			const int att_ref = cal.has(9) ? (cal.reg[9] & 0xff) : mu.nvram()[0x3e96a];
+			const int rest = xg::nv::volume_rest(rom, el, note, vel);
+			const int fwl = xg::nv::fw_voice_level(mu.nvram().data(), ch);
+			cal.base_level =
+			    (fwl > 0 && xg::nv::volume_att_from(rom, fwl, rest,
+			                                        xg::nv::VOL_GAIN_DEF) == att_ref)
+			    ? xg::nv::base_level_from_fw(rom, el, fwl, note)
+			    : xg::nv::calibrate_level(rom, el, att_ref, note, vel);
+		}
 		cal.have = true;
 		out.push_back(cal);
 	}
@@ -180,6 +190,13 @@ int main(int argc, char **argv)
 	bool atwatch = false;
 	int catoff = -1;
 	bool xgmap = false;
+	const char *sxsettle = nullptr;
+	bool egwatch = false;
+	bool slotalloc = false;
+	bool levelcheck = false;
+	bool keycut = false;
+	bool nocal = false;
+	const char *ramdump = nullptr;
 	for (int i = 3; i < argc; i++) {
 		if (!std::strcmp(argv[i], "-b") && i + 1 < argc)
 			std::sscanf(argv[++i], "%d,%d,%d", &msb, &lsb, &prog);
@@ -206,6 +223,13 @@ int main(int argc, char **argv)
 		else if (!std::strcmp(argv[i], "--portasweep") && i + 1 < argc) portasweep = std::atoi(argv[++i]);
 		else if (!std::strcmp(argv[i], "--at")) atwatch = true;
 		else if (!std::strcmp(argv[i], "--xgmap")) xgmap = true;
+		else if (!std::strcmp(argv[i], "--sxsettle") && i + 1 < argc) sxsettle = argv[++i];
+		else if (!std::strcmp(argv[i], "--egwatch")) egwatch = true;
+		else if (!std::strcmp(argv[i], "--slotalloc")) slotalloc = true;
+		else if (!std::strcmp(argv[i], "--levelcheck")) levelcheck = true;
+		else if (!std::strcmp(argv[i], "--keycut")) keycut = true;
+		else if (!std::strcmp(argv[i], "--nocal")) nocal = true;
+		else if (!std::strcmp(argv[i], "--ramdump") && i + 1 < argc) ramdump = argv[++i];
 		else if (!std::strcmp(argv[i], "--catoff") && i + 1 < argc) catoff = int(std::strtol(argv[++i], nullptr, 0));
 		else if (!std::strcmp(argv[i], "--sweep") && i + 1 < argc) sweep = std::atoi(argv[++i]);
 		else if (!std::strcmp(argv[i], "--volsweep") && i + 1 < argc) volsweep = std::atoi(argv[++i]);
@@ -468,7 +492,7 @@ int main(int argc, char **argv)
 			for (int ch = 0; ch < 64; ch++)
 				if (keyed & (u64(1) << ch)) {
 					std::printf("%3d", v);
-					for (int rr = 0; rr < 0x20; rr++) {
+					for (int rr = 0; rr < 0x40; rr++) {
 						const auto it = seen.find(u32(ch) * 64 + u32(rr));
 						std::printf(" %04x", it == seen.end() ? 0xffff : it->second);
 					}
@@ -539,6 +563,67 @@ int main(int argc, char **argv)
 	}
 
 	// --cutsweep: 強さを 1 から 127 まで振って、フィルタ（0x00）と共振（0x04）を並べる
+	// --ramdump <ファイル>: 1 音鳴らしてからワーク RAM を丸ごと書き出す。
+	// firmware が音色ごとに作る表（鍵の追従など）を外から探すための道具
+	if (ramdump) {
+		for (u8 bb : { u8(0x90), u8(note & 0x7f), u8(vel & 0x7f) })
+			mu.midi_in(bb, 0);
+		for (u32 i = 0; i < u32(seconds * RATE); i++)
+			mu.run_sample(l, r);
+		const std::vector<u8> &w = mu.nvram();
+		if (std::FILE *f = std::fopen(ramdump, "wb")) {
+			std::fwrite(w.data(), 1, w.size(), f);
+			std::fclose(f);
+			std::printf("ワーク RAM %zu バイトを書き出した%c", w.size(), 10);
+		}
+		return 0;
+	}
+
+	// --keycut: **鍵ごとに** 0x00（フィルタの切る高さ）を並べる。1 回の起動で
+	// 端から端まで見る（音は 1 つずつ離すので、声が枯れない）。
+	// レジスタ 0x00 は鍵でも動く（doc/native-engine.md の 6.54）ので、
+	// その形を測るための道具
+	if (keycut) {
+		std::map<u32, u16> now, seen;
+		u64 mask = 0, keyed = 0;
+		mu.set_swp_watch([&](bool master, u32 r2, u16 v2) {
+			if (!master) return;
+			now[r2] = v2;
+			if (r2 == 0x20e && seen.empty())
+				seen = now;
+			switch (r2) {
+			case 0x18e: mask = (mask & ~(u64(0xffff) << 48)) | (u64(v2) << 48); break;
+			case 0x18f: mask = (mask & ~(u64(0xffff) << 32)) | (u64(v2) << 32); break;
+			case 0x1ce: mask = (mask & ~(u64(0xffff) << 16)) | (u64(v2) << 16); break;
+			case 0x1cf: mask = (mask & ~u64(0xffff)) | v2; break;
+			case 0x20e: keyed |= mask; break;
+			default: break;
+			}
+		});
+		for (int nn = 0; nn < 128; nn++) {
+			keyed = 0;
+			now.clear();
+			seen.clear();
+			for (u8 bb : { u8(0x90), u8(nn), u8(vel & 0x7f) })
+				mu.midi_in(bb, 0);
+			for (u32 i = 0; i < RATE / 50; i++)
+				mu.run_sample(l, r);
+			for (int ch = 0; ch < 64; ch++)
+				if (keyed & (u64(1) << ch)) {
+					const auto a0 = seen.find(u32(ch) * 64 + 0);
+					std::printf("KEY %d %04x\n", nn,
+					            a0 == seen.end() ? 0xffff : a0->second);
+					break;
+				}
+			for (u8 bb : { u8(0x80), u8(nn), u8(64) })
+				mu.midi_in(bb, 0);
+			for (u32 i = 0; i < RATE / 25; i++)
+				mu.run_sample(l, r);
+		}
+		mu.set_swp_watch(nullptr);
+		return 0;
+	}
+
 	if (cutsweep) {
 		std::map<u32, u16> now, seen;
 		u64 mask = 0, keyed = 0;
@@ -675,6 +760,309 @@ int main(int argc, char **argv)
 			if (o.vel == 100 && o.cut >= 0)
 				std::printf("CUT 鍵 %3d 強さ %3d  0x00=%04x 切る高さ %4d（表との差 %+d） 0x04=%04x%c",
 				            o.note, o.vel, o.cut, o.cut & 0x7ff, (o.cut & 0x7ff) - tab, o.res, 10);
+		return 0;
+	}
+
+	// --levelcheck: **音量の式を実機と並べる**。
+	// まず鍵 60・強さ 100 で 1 音鳴らして校正し（写し取りと同じ）、
+	// そのあと鍵と強さを振って、実機が 0x09 に入れる値とこちらの式を比べる
+	if (levelcheck) {
+		// 鳴らして、**波形の番地ごとに** 0x09 を拾う（要素が 2 つ以上の音色で、
+		// どちらの要素の値かを取り違えないため）
+		auto play_map = [&](int nn, int vv) -> std::map<u32, int> {
+			u64 mask = 0, keyed = 0;
+			int got = -1;
+			std::map<u32, u16> last;
+			mu.set_swp_watch([&](bool master, u32 r2, u16 v2) {
+				if (!master) return;
+				switch (r2) {
+				case 0x18e: mask = (mask & ~(u64(0xffff) << 48)) | (u64(v2) << 48); break;
+				case 0x18f: mask = (mask & ~(u64(0xffff) << 32)) | (u64(v2) << 32); break;
+				case 0x1ce: mask = (mask & ~(u64(0xffff) << 16)) | (u64(v2) << 16); break;
+				case 0x1cf: mask = (mask & ~u64(0xffff)) | v2; break;
+				case 0x20e: keyed |= mask; break;
+				default:
+					if (r2 < 0x1000 && ((r2 % 64) == 9 || (r2 % 64) == 0x16 ||
+					                    (r2 % 64) == 0x17))
+						last[r2] = v2;
+					break;
+				}
+			});
+			for (u8 bb : { u8(0x90), u8(nn & 0x7f), u8(vv & 0x7f) })
+				mu.midi_in(bb, 0);
+			for (u32 i = 0; i < RATE / 20; i++)
+				mu.run_sample(l, r);
+			std::map<u32, int> out;
+			for (int ch = 0; ch < 64; ch++)
+				if ((keyed & (u64(1) << ch)) && last.count(u32(ch) * 64 + 9) &&
+				    last.count(u32(ch) * 64 + 0x16) && last.count(u32(ch) * 64 + 0x17)) {
+					const u32 wa = u32(last[u32(ch) * 64 + 0x16]) << 16 |
+					               last[u32(ch) * 64 + 0x17];
+					out[wa] = int(last[u32(ch) * 64 + 9] & 0xff);
+				}
+			for (u8 bb : { u8(0x80), u8(nn & 0x7f), u8(64) })
+				mu.midi_in(bb, 0);
+			for (u32 i = 0; i < RATE / 20; i++)
+				mu.run_sample(l, r);
+			mu.set_swp_watch(nullptr);
+			return out;
+		};
+		// **要素ごとに**比べる。波形の番地で実機の値と結び付ける
+		const int nel = xg::nv::element_count(rom, rec);
+		std::printf("== 音量の式くらべ（鍵 60・強さ 100 で校正。要素 %d 個）%c", nel, 10);
+		int bad = 0, n = 0;
+		for (int k = 0; k < nel; k++) {
+			const u8 *el = xg::nv::element(rom, rec, k);
+			const u8 *we0 = xg::nv::wave_entry(rom, xg::nv::wave_set(el),
+			                                   xg::nv::wave_note(el, 60));
+			if (!we0)
+				continue;
+			const u32 wa0 = xg::nv::read_wave(we0).format_addr;
+			const std::map<u32, int> m0 = play_map(60, 100);
+			const auto it0 = m0.find(wa0);
+			if (it0 == m0.end()) {
+				std::printf("  要素 %d: 校正の音が拾えなかった%c", k, 10);
+				continue;
+			}
+			// **先に測ってから**総当たりする。m を振るたびに鳴らし直すと、
+			// firmware の声が枯れて比較点が無くなり、どの m も「外れ 0」に見えた
+			{
+				static const int KEYS[6] = { 36, 48, 60, 72, 84, 96 };
+				int got6[6];
+				int have = 0;
+				for (int q = 0; q < 6; q++) {
+					got6[q] = -1;
+					const u8 *w3 = xg::nv::wave_entry(rom, xg::nv::wave_set(el),
+					                                  xg::nv::wave_note(el, KEYS[q]));
+					if (!w3)
+						continue;
+					const u32 wa3 = xg::nv::read_wave(w3).format_addr;
+					const std::map<u32, int> m3 = play_map(KEYS[q], 100);
+					const auto i3 = m3.find(wa3);
+					if (i3 != m3.end()) {
+						got6[q] = i3->second;
+						have++;
+					}
+				}
+				const int cref = xg::nv::level_key_curve(rom, el, 60);
+				const int rest = it0->second / 2 - xg::nv::velocity_att(rom, 100)
+				               - xg::nv::wave_level(rom, el, 60);
+				int bestbad = 1 << 30, good[17] = {};
+				for (int m = 0; m <= 16; m++) {
+					const int b2 = xg::nv::level_from_att(rom, rest) - (cref * m) / 4;
+					int bad2 = 0;
+					for (int q = 0; q < 6; q++) {
+						if (got6[q] < 0)
+							continue;
+						int l3 = b2 + (xg::nv::level_key_curve(rom, el, KEYS[q]) * m) / 4;
+						if (l3 < 0) l3 = 0;
+						if (l3 > 127) l3 = 127;
+						const int a3 = rom[xg::nv::LEVEL_TAB + 0x80 + u32(l3)]
+						             + xg::nv::velocity_att(rom, 100)
+						             + xg::nv::wave_level(rom, el, KEYS[q]);
+						if (std::min(0xff, a3 * 2) != got6[q])
+							bad2++;
+					}
+					good[m] = bad2;
+					if (bad2 < bestbad)
+						bestbad = bad2;
+				}
+				std::printf("  要素 %d: 比較点 %d 個、いちばん外れが少ないのは %d 点 → 効き具合:",
+				            k, have, bestbad);
+				for (int m = 0; m <= 16; m++)
+					if (good[m] == bestbad)
+						std::printf(" %d/4", m);
+				std::printf("   曲線番号 %d  byte59=%d%c",
+				            (int(el[66]) << 8) | el[67], el[59], 10);
+			}
+			const int base = xg::nv::calibrate_level(rom, el, it0->second, 60, 100);
+			std::printf("  -- 要素 %d（素の音量 %d）%c", k, base, 10);
+			std::printf("     鍵  強さ   実機   こちら   ずれ   曲線  段音量  要る値%c", 10);
+			for (int nn : { 36, 48, 60, 72, 84, 96 })
+				for (int vv : { 20, 60, 100, 127 }) {
+					const u8 *we2 = xg::nv::wave_entry(rom, xg::nv::wave_set(el),
+					                                   xg::nv::wave_note(el, nn));
+					if (!we2)
+						continue;
+					const u32 wa = xg::nv::read_wave(we2).format_addr;
+					const std::map<u32, int> mm = play_map(nn, vv);
+					const auto it = mm.find(wa);
+					if (it == mm.end())
+						continue;
+					const int got = it->second;
+					const int mine = xg::nv::volume_att(rom, el, base, nn, vv);
+					const int cv = xg::nv::level_key_curve(rom, el, nn);
+					const int wl = xg::nv::wave_level(rom, el, nn);
+					const int need = got / 2 - base - xg::nv::velocity_att(rom, vv)
+					               - 0;
+					n++;
+					if (got != mine)
+						bad++;
+					std::printf("    %3d  %3d   %4d   %4d   %+4d %-6s %+4d  %4d  %4d%c",
+					            nn, vv, got, mine, mine - got,
+					            got == mine ? "" : "← 違う", cv, wl, need, 10);
+				}
+		}
+		std::printf("ずれた点: %d / %d%c", bad, n, 10);
+		return 0;
+	}
+
+	// --slotalloc: firmware が「どのスロットを使っているか」を持っている場所を
+	// ワーク RAM から探す。音を 1 つずつ足していき、そのたびに
+	// **鳴っているスロットの 64bit のマスク**と同じ並びが RAM に無いかを見る。
+	// 見つかれば、native が使うスロットもそこに立てておけば firmware が避ける
+	if (slotalloc) {
+		const std::vector<u8> &wr = mu.nvram();
+		u64 mask = 0, live = 0;
+		mu.set_swp_watch([&](bool master, u32 r2, u16 v2) {
+			if (!master) return;
+			switch (r2) {
+			case 0x18e: mask = (mask & ~(u64(0xffff) << 48)) | (u64(v2) << 48); break;
+			case 0x18f: mask = (mask & ~(u64(0xffff) << 32)) | (u64(v2) << 32); break;
+			case 0x1ce: mask = (mask & ~(u64(0xffff) << 16)) | (u64(v2) << 16); break;
+			case 0x1cf: mask = (mask & ~u64(0xffff)) | v2; break;
+			case 0x20e: live |= mask; break;
+			default: break;
+			}
+		});
+		// 候補を全部の位置で持ち、合わなくなったら落としていく
+		std::vector<size_t> cand;
+		const int STEPS = 10;
+		for (int step = 0; step < STEPS; step++) {
+			for (u8 bb : { u8(0x90), u8((40 + step * 3) & 0x7f), u8(vel & 0x7f) })
+				mu.midi_in(bb, 0);
+			for (u32 i = 0; i < RATE / 5; i++)
+				mu.run_sample(l, r);
+			// いま鳴っているスロットの並びを、8 バイトの窓として作る
+			u8 want[8];
+			for (int b = 0; b < 8; b++)
+				want[b] = u8(live >> (b * 8));
+			u8 wantr[8];                      // バイトの順が逆のもの
+			for (int b = 0; b < 8; b++)
+				wantr[b] = want[7 - b];
+			if (step == 0) {
+				for (size_t o = 0; o + 8 <= wr.size(); o++)
+					if (!std::memcmp(&wr[o], want, 8) || !std::memcmp(&wr[o], wantr, 8))
+						cand.push_back(o);
+			} else {
+				std::vector<size_t> keep;
+				for (size_t o : cand)
+					if (!std::memcmp(&wr[o], want, 8) || !std::memcmp(&wr[o], wantr, 8))
+						keep.push_back(o);
+				cand.swap(keep);
+			}
+			std::printf("  %2d 音目: 鳴っているスロット %d 個（%016llx）候補 %zu%c",
+			            step + 1, __builtin_popcountll(live),
+			            (unsigned long long)live, cand.size(), 10);
+			if (cand.empty())
+				break;
+		}
+		mu.set_swp_watch(nullptr);
+		std::printf("== 64bit のマスクとして持っていそうな場所%c", 10);
+		for (size_t o : cand)
+			std::printf("  RAM %08x%c", unsigned(0x400000 + o), 10);
+		if (cand.empty())
+			std::printf("  見つからなかった（64bit のまとまりでは持っていないらしい）%c", 10);
+		for (u8 bb : { u8(0xb0), u8(0x78), u8(0) })
+			mu.midi_in(bb, 0);
+		return 0;
+	}
+
+	// --egwatch: 1 音鳴らして、**包絡線のレジスタ（0x06/0x07/0x08/0x09）を
+	// firmware がいつ書くか**を鍵を押した時刻からの相対で出す。
+	// 写し取りの窓（鳴り始めてから 5ms）がこれを取り切れているかを見るための口
+	if (egwatch) {
+		u64 mask = 0, keyed = 0, t = 0, t0 = 0;
+		struct ev { u64 t; u8 ch, reg; u16 v; };
+		std::vector<ev> log;
+		mu.set_swp_watch([&](bool master, u32 r2, u16 v2) {
+			if (!master) return;
+			switch (r2) {
+			case 0x18e: mask = (mask & ~(u64(0xffff) << 48)) | (u64(v2) << 48); break;
+			case 0x18f: mask = (mask & ~(u64(0xffff) << 32)) | (u64(v2) << 32); break;
+			case 0x1ce: mask = (mask & ~(u64(0xffff) << 16)) | (u64(v2) << 16); break;
+			case 0x1cf: mask = (mask & ~u64(0xffff)) | v2; break;
+			case 0x20e: keyed |= mask; if (!t0) t0 = t; break;
+			default: {
+				const u32 rr = r2 % 64;
+				if (r2 < 0x1000 && ((rr >= 0x06 && rr <= 0x09) || rr == 0x00 || rr == 0x04))
+					log.push_back({ t, u8(r2 / 64), u8(rr), v2 });
+				break;
+			}
+			}
+		});
+		for (u8 bb : { u8(0x90), u8(note & 0x7f), u8(vel & 0x7f) })
+			mu.midi_in(bb, 0);
+		for (; t < RATE / 2; t++)
+			mu.run_sample(l, r);
+		const u64 key_at = t0;
+		for (u8 bb : { u8(0x80), u8(note & 0x7f), u8(64) })
+			mu.midi_in(bb, 0);
+		for (u32 i = 0; i < RATE / 2; i++) { mu.run_sample(l, r); t++; }
+		mu.set_swp_watch(nullptr);
+		{
+			const std::vector<u8> &wr2 = mu.nvram();
+			std::printf("== 全体に効く値: 0x4226A8=%d 0x4226BC=%d 0x4226A9=%d%c",
+			            wr2[0x226A8], wr2[0x226BC], wr2[0x226A9], 10);
+		}
+		std::printf("== 包絡線のレジスタを書いた時刻（鍵を押した時点を 0 とする）%c", 10);
+		std::printf("   写し取りの窓は「鳴り始めから 5ms」= +5.0ms まで%c", 10);
+		int n = 0;
+		for (const ev &e : log) {
+			if (!(keyed & (u64(1) << e.ch)))
+				continue;
+			const double ms = (double(s64(e.t)) - double(s64(key_at))) * 1000.0 / RATE;
+			std::printf("  %+9.2f ms  スロット%2d  0x%02x = %04x%s%c", ms, int(e.ch),
+			            int(e.reg), e.v, ms > 5.0 && ms < 300.0 ? "   ← 窓の外" : "", 10);
+			if (++n > 60)
+				break;
+		}
+		std::printf("  書いた回数 %d%c", int(log.size()), 10);
+		return 0;
+	}
+
+	// --sxsettle hh,mm,ll,dd[,dd...]: その XG パラメータチェンジを送って、
+	// **firmware が SWP30 を触り終わるまで**の時間を測る。
+	// 「種類を変える」と「値だけ変える」で桁が違うかを見るための口。
+	// 毎サンプル書き替わるレジスタ（MEG の戻りのミキサ 0x38-0x3F と 0x0E/0x0F）は
+	// 数えない。数えると永久に落ち着かない
+	if (sxsettle) {
+		std::vector<u8> body;
+		for (const char *p = sxsettle; *p; ) {
+			body.push_back(u8(std::strtol(p, nullptr, 16)));
+			const char *c = std::strchr(p, ',');
+			if (!c)
+				break;
+			p = c + 1;
+		}
+		if (body.size() < 4) {
+			std::fprintf(stderr, "--sxsettle は hh,mm,ll,dd の形で（16 進）%c", 10);
+			return 1;
+		}
+		u32 last = 0, n2 = 0;
+		mu.set_swp_watch([&](bool master, u32 r2, u16) {
+			if (!master)
+				return;
+			const u32 rr = r2 % 64;
+			if (r2 < 0x1000 && (rr == 0x0e || rr == 0x0f || (rr >= 0x38 && rr <= 0x3f)))
+				return;              // 毎サンプル書き替わるので数えない
+			last = n2;
+		});
+		std::vector<u8> msg = { 0xf0, 0x43, 0x10, 0x4c };
+		u32 sum = 0;
+		for (u8 b : body) { msg.push_back(b); sum += b; }
+		msg.push_back(u8((0x80 - (sum & 0x7f)) & 0x7f));
+		msg.push_back(0xf7);
+		for (u8 b : msg)
+			mu.midi_in(b, 0);
+		for (; n2 < RATE * 2; n2++)
+			mu.run_sample(l, r);
+		mu.set_swp_watch(nullptr);
+		std::printf("== 08 xx …: ");
+		for (u8 b : body)
+			std::printf("%02X ", b);
+		std::printf("%c   SWP30 を触り終わるまで %u サンプル（%.1f ms）%c",
+		            10, last, double(last) * 1000.0 / RATE, 10);
 		return 0;
 	}
 
@@ -984,7 +1372,24 @@ int main(int argc, char **argv)
 		}
 		std::printf("== CC%d で動くワーク RAM のバイト%c", ccbyte, 10);
 		int shown = 0;
+		// **パートの塊を先に出す**（ほかの所は毎サンプル動く雑音が多く、
+		// 上限をそれで使い切ってしまう）
+		for (u32 q = 0; q < 0x200; q++) {
+			bool same = true;
+			for (size_t k = 1; k < snap.size(); k++)
+				if (snap[k][part0 + q] != snap[0][part0 + q])
+					same = false;
+			if (same)
+				continue;
+			std::printf("  パート+0x%02x :", q);
+			for (size_t k = 0; k < snap.size(); k++)
+				std::printf(" cc%d=%d", ccs[k], snap[k][part0 + q]);
+			std::printf("%c", 10);
+			shown++;
+		}
 		for (size_t o = 0; o < wr.size() && shown < 40; o++) {
+			if (o >= part0 && o < part0 + 0x200)
+				continue;
 			bool same = true;
 			for (size_t k = 1; k < snap.size(); k++)
 				if (snap[k][o] != snap[0][o])
@@ -1570,7 +1975,26 @@ int main(int argc, char **argv)
 		for (u8 b : { u8(0x90), u8(note & 0x7f), u8(vel & 0x7f) })
 			mu.midi_in(b, 0);
 	} else {
+		// **その鍵と強さで実際に鳴る要素**を選ぶ（EPiano1 のように強さで
+		// 要素が切り替わる音色がある。要素 0 で決め打つと測り間違える）
+		// **遅れない要素を先に選ぶ**。firmware は byte72 の遅れが無い要素から
+		// 鳴らすので、遅れる要素を選ぶと実機と別のスロットを見ることになる
+		// （Syn Strings は要素 0 が byte72=2 で、パンが左右逆に出ていた）
 		const u8 *elem = xg::nv::element(rom, rec, 0);
+		{
+			const int n = xg::nv::element_count(rom, rec);
+			const u8 *fallback = nullptr;
+			for (int i = 0; i < n; i++) {
+				const u8 *e2 = xg::nv::element(rom, rec, i);
+				if (!xg::nv::element_active(e2, note, vel))
+					continue;
+				if (!fallback)
+					fallback = e2;
+				if (!xg::nv::elem_delay(e2)) { fallback = e2; break; }
+			}
+			if (fallback)
+				elem = fallback;
+		}
 		// 先に 1 音だけ firmware に鳴らしてもらって癖を写し取る
 		const std::vector<u8> before1 = mu.save_state();
 		const xg::nv::voice_cal cal = take_cal(mu, rom, rec, note, vel, RATE);
@@ -1579,7 +2003,10 @@ int main(int argc, char **argv)
 		// ---- ここから SH-2 を止める
 		mu.set_cpu_enabled(false);
 		const int att = xg::nv::volume_att(rom, elem, cal.base_level, note, vel);
-		xg::nv::slot_regs regs = xg::nv::build_note(rom, elem, note, att, &cal);
+		// --nocal: 写し取りを一切混ぜず、式だけで組む（段 3 の進み具合を測る）
+		xg::nv::slot_regs regs = xg::nv::build_note(rom, elem, note, att,
+		                                            nocal ? nullptr : &cal,
+		                                            xg::nv::defaults(), 0, vel);
 		if (copyall) {
 			// 切り分け用: 写し取った値をそのまま全部使う（式を一切使わない）
 			for (int i = 0; i < 0x40; i++)

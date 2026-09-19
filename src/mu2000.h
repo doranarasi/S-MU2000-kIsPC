@@ -22,6 +22,7 @@
 #include "mame/video/hd44780.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <cstring>
 #include <atomic>
@@ -323,10 +324,13 @@ public:
 	std::atomic<u64> m_ne_by_other{0};   // 音色の指定・CC など
 	std::atomic<u64> m_ne_by_learn{0};   // 写し取り（その音色の 1 音目）
 	std::atomic<u64> m_ne_by_midi{0};    // 渡した MIDI を受け取らせている
+	std::atomic<u64> m_ne_by_keep{0};    // 止めきらないために細く回している
 	u8   m_fw_why = 0;                   // いまの hold の理由（1 SysEx / 2 そのほか）
 	// SysEx の頭を少し覚えて、長く回す必要があるかを見分ける
 	int  m_sx_pos = -1;
-	u8   m_sx[5] = {};
+	// XG のパラメータチェンジは 43 1n 4C hh mm ll dd… の形。パートの設定
+	// （08 pp ll）は自分でも効かせたいので、値まで取っておく
+	u8   m_sx[24] = {};
 
 	struct native_stats { u64 note_native = 0, note_fw = 0, learn = 0, other = 0; };
 	native_stats native_counts() const { return m_ne_stats; }
@@ -338,7 +342,7 @@ public:
 	size_t native_cal_count() const { return m_ndrv.cal_count(); }
 	int native_peak_slots() const { return m_ndrv.peak_slots(); }
 
-	struct native_why { u64 total, by_note, by_sysex, by_other, by_learn, by_midi; };
+	struct native_why { u64 total, by_note, by_sysex, by_other, by_learn, by_midi, by_keep; };
 	native_why native_why_counts() const
 	{
 		return { m_ne_samples.load(std::memory_order_relaxed),
@@ -346,7 +350,8 @@ public:
 		         m_ne_by_sysex.load(std::memory_order_relaxed),
 		         m_ne_by_other.load(std::memory_order_relaxed),
 		         m_ne_by_learn.load(std::memory_order_relaxed),
-		         m_ne_by_midi.load(std::memory_order_relaxed) };
+		         m_ne_by_midi.load(std::memory_order_relaxed),
+		         m_ne_by_keep.load(std::memory_order_relaxed) };
 	}
 
 	// native の口が、いま firmware を回している割合（0-1。小さいほど軽い）
@@ -393,34 +398,84 @@ private:
 	// 内訳: MIDI は 1 バイト 10 ビット・31250 baud なので 14.1 サンプルかかる。
 	// 3 バイトの鍵で 42 サンプル、残り 32 サンプルが firmware の中の手間
 	static constexpr u32 NATIVE_DELAY = 74;
-	static constexpr u32 NATIVE_PROC  = 32;          // バイトを受け終えてから鳴るまで
-	static constexpr u64 RX_BYTE_TICK = 903;         // 1 バイト（1/64 サンプル単位）
+	// **バイトを受け終えてから鳴るまで**（1/64 サンプル単位）。
+	// 実機の遅れは 72 と 73 を行き来する ＝ 端数がある。整数で足していた
+	// ころは必ず 73 になり、1 サンプルずれる音が出ていた（doc の 6.92）。
+	// `SMU2000_NATIVE_PROC` で振れる（1/64 サンプル単位）
+	static u32 native_proc64()
+	{
+		static const u32 v = std::getenv("SMU2000_NATIVE_PROC")
+		                   ? u32(std::atoi(std::getenv("SMU2000_NATIVE_PROC"))) : 32 * 64;
+		return v;
+	}
+	// 1 バイト（1/64 サンプル単位）。`SMU2000_RX_BYTE` で振れる（0 にすると
+	// 和音の音が全部同じ時刻に出る。相対のずれを調べる用。doc の 6.78）
+	static u64 rx_byte_tick()
+	{
+		static const u64 v = std::getenv("SMU2000_RX_BYTE")
+		                   ? u64(std::atoi(std::getenv("SMU2000_RX_BYTE"))) : 903;
+		return v;
+	}
 	u64  m_rx_at[MIDI_PORTS] = {};                   // その口が次のバイトを受け終える時刻
-	struct nev { u64 at; u8 kind, part, d0, d1; };   // kind 0=離し 1=押し 2=CC 3=ベンド
+	// kind 0=離し 1=押し 2=CC 3=ベンド 4=音色の指定 5=XG のパートの設定（08 pp d0=d1）
+	struct nev { u64 at; u8 kind, part, d0, d1; };
 	std::deque<nev> m_nq;
 	u64  m_ne_clock = 0;
 	u32  m_nown[64][4] = {};       // native で鳴らしている鍵（パートごとに 128 ビット）
 
 	void native_pump();
 	// 写し取った音の、フィルタの動きを録る（doc/native-engine.md の 6.17）
-	bool m_traj_rec = false;
-	u32  m_traj_left = 0;
-	u64  m_traj_start = 0;
-	u32  m_traj_rec_key = 0;
-	u64  m_traj_drum_key = 0;
-	int  m_traj_chan[64];          // チャンネル → 何番目の写し取りか（-1 は使わない）
-	std::vector<xg::nv::voice_cal> *m_traj_cals = nullptr;
-	u32  m_traj_n = 0;
-	void traj_start(u32 rec, u64 drum_key, int ncal);
-	void traj_finish();
+	// **フィルタの動きの録り**。同時に何本も走らせる。
+	// 1 本しか持てなかったころは、次の音色の写し取りが始まると前の録りが
+	// そこで切れていた。切れないように「録っている間は写し取りを始めない」
+	// ようにしていたが、そうすると窓を延ばせず、押している間の包絡線が
+	// 1 秒で止まっていた（doc/native-engine.md の 6.61）
+	struct traj_rec {
+		std::vector<xg::nv::voice_cal> *cals = nullptr;
+		u64  start = 0;
+		u32  left = 0;          // 0 なら空き
+		u32  n = 0;
+		u32  rec_key = 0;
+		u32  ctx = 0;
+		u64  drum_key = 0;
+		s8   chan[64] = {};     // チャンネル → 何番目の写しか（-1 は関係なし）
+		u64  rel_at[64] = {};   // そのスロットを離した時刻（0 はまだ）
+	};
+	static constexpr int TRAJ_MAX = 6;
+	traj_rec m_trajs[TRAJ_MAX];
+	bool traj_any() const
+	{
+		for (const traj_rec &t : m_trajs)
+			if (t.left)
+				return true;
+		return false;
+	}
+	void traj_step();               // 1 サンプルぶん進める
+	void traj_watch(u32 reg, u16 value);
+	bool m_traj_rec = false;        // どれか 1 本でも録っているか（native_driver へ渡す用）
+	// **写し取ったスロット → 写し取りの並びの番号**。写し取りを組むときに
+	// 覚えておき、段の録画（traj）でそのまま使う。前はキーオンの順で
+	// 数え直していたので、途中で捨てたスロットがあるとずれていた
+	// （ドラムは 1 段も録れていなかった。doc/native-engine.md の 6.88）
+	s8 m_learn_chan[64] = {};
+	void traj_start(u32 rec, u64 drum_key, int ncal, u32 ctx);
+	void traj_finish_one(int i);
+
+	// **短すぎる写しは取り直す**。フィルタの動きは firmware に鳴らさせた
+	// 1 音から録るので、その音が短いと途中で切れる。切れたぶんは native で
+	// 鳴らすときに「そこで止まった音」になり、実機より暗い（利用者の曲で
+	// 中域が 1dB 足りなかった）。何度か取り直して、いちばん長いものを使う
+	static constexpr u32 TRAJ_ENOUGH = 60;   // 60 段 ＝ 0.6 秒ぶん
+	static constexpr int TRAJ_TRIES  = 4;
+	std::map<u64, int> m_traj_tries;
 	// そのバイトを受け終える時刻を進めて、鳴らすべき時刻（サンプル）を返す
 	u64 rx_advance(int port)
 	{
 		const u64 now = m_ne_clock * 64;
 		if (m_rx_at[port] < now)
 			m_rx_at[port] = now;
-		m_rx_at[port] += RX_BYTE_TICK;
-		return m_rx_at[port] / 64 + NATIVE_PROC;
+		m_rx_at[port] += rx_byte_tick();
+		return (m_rx_at[port] + native_proc64()) / 64;
 	}
 	bool nown(int part, int note) const
 	{ return (m_nown[part][(note >> 5) & 3] & (u32(1) << (note & 31))) != 0; }
@@ -435,6 +490,8 @@ private:
 	struct part_prog { u8 msb = 0, lsb = 0, prog = 0; };
 	part_prog m_prog_sel[64];
 	void native_select_voice(int part);
+	// 受け取り終えた XG の SysEx を、native の側にも効かせる
+	void native_sysex(u64 fire);
 
 	// 口ごとの MIDI の読み取り
 	struct nmidi { u8 status = 0; u8 d0 = 0; int have = 0; };
@@ -450,6 +507,40 @@ private:
 	static constexpr u64 FW_NOTE_RUN = 44100 * 5;   // 1.2 秒
 	u64  m_fw_note_until = 0;
 	u64  m_learn_drum = 0;         // ドラムのとき、覚える鍵
+	// 写し取りのとき、firmware がこちらの鳴っているスロットを取ってしまった回数
+	u32  m_ne_slot_clash = 0;
+	// 写し取りの窓の中で、別の音が同じスロットに鳴り始めた回数
+	u32  m_ne_learn_dirty = 0;
+	// 写し取りで、その音色のものでないスロットを掴んで捨てた回数
+	u32  m_ne_learn_wrong = 0;
+	// **写し取りの鍵**。firmware は XG のノートシフト（08 pp 08）を足して
+	// から鳴らすので、こちらの式もその鍵で見ないと合わない
+	// **写し取りの強さ**。firmware はベロシティ感度（08 pp 0C・0D）を掛けて
+	// から鳴らすので、こちらの式もその強さで見る
+	int  learn_vel_sensed() const
+	{ return m_ndrv.part_vel(m_learn_part, m_learn_vel); }
+	int  learn_note_shifted() const
+	{
+		const int n = m_learn_note + m_ndrv.part_shift(m_learn_part);
+		return n < 0 ? 0 : (n > 127 ? 127 : n);
+	}
+	// 実機のボイスの塊から読んだ音量の目盛りが、写し取った 0x09 と合わなかった数
+	u32  m_ne_lvl_miss = 0;
+	// firmware が、こちらが鳴らしているスロットに書いた回数
+	u32  m_ne_fw_stomp = 0;
+	void note_fw_swp(bool master, u32 reg, u16 value);
+	u64  m_fw_keymask = 0;     // firmware がつぎに鳴らすスロットのマスク
+	// firmware を細く回し続ける刻み（100ms ごとに 5ms）。止めきると液晶・
+	// ボタン・firmware 自身の後始末が全部止まる
+	static constexpr u32 KEEPALIVE_EVERY = 4410;
+	static constexpr u32 KEEPALIVE_RUN = 220;
+public:
+	u32  native_slot_clash() const { return m_ne_slot_clash; }
+	u32  native_learn_dirty() const { return m_ne_learn_dirty; }
+	u32  native_learn_wrong() const { return m_ne_learn_wrong; }
+	u32  native_level_miss() const { return m_ne_lvl_miss; }
+	u32  native_fw_stomp() const { return m_ne_fw_stomp; }
+private:
 	native_stats m_ne_stats;
 
 	bool native_midi(u8 byte, int port);
